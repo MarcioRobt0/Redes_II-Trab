@@ -97,7 +97,13 @@ graficos_resultado/
 
 
 ## 👤 Autor
-## 👤 Autor
-
-[![Perfil do GitHub](https://github-readme-stats.vercel.app/api?username=seu-usuario&show_icons=true&theme=radial)](https://github.com/MarcioRobt0)
-
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/MarcioRobt0">
+        <img src="https://github.com/MarcioRobt0.png" width="100px;" alt="Foto do seu-usuario"/><br>
+        <sub><b>Márcio Roberto de Brito Rodrigues</b></sub>
+      </a>
+    </td>
+  </tr>
+</table>
