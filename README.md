@@ -93,10 +93,11 @@ graficos_resultado/
 | `docker compose down` | Para e remove containers |
 | `docker compose logs redes_client` | Exibe logs do cliente |
 | `docker compose exec redes_client bash` | Shell interativo no cliente |
-| `docker compose cp redes_server:/app/received_files/. ./received_files/` | Copia arquivos do servidor |
 | `bash limpar_ambiente.sh` | Limpa logs, pcaps, reinicia servidor |
 
 
 ## 👤 Autor
+## 👤 Autor
 
+[![Perfil do GitHub](https://github-readme-stats.vercel.app/api?username=seu-usuario&show_icons=true&theme=radial)](https://github.com/MarcioRobt0)
 
