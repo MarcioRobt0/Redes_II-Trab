@@ -1,0 +1,21 @@
+# Arquivos gerados pelos testes
+logs/
+pcaps/
+received_tcp/
+received_files/
+
+# Arquivos de teste grandes
+*.pcap
+*.csv
+
+# Git e cache Python
+.git/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Ambiente virtual Python
+venv/
+.venv/
+env/

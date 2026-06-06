@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+
+# Saída de teste e artefatos de execução
+logs/
+pcaps/
+received_files/
+received_tcp/
+graficos_resultado/
