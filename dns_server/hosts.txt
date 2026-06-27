@@ -1,0 +1,9 @@
+# Arquivo de zona estatica - Servidor DNS Local
+# Formato: NOME_DE_DOMINIO  TIPO  IP
+# Linhas iniciadas com '#' sao comentarios e ignoradas
+# Apenas registros do tipo A (IPv4) sao suportados nesta versao
+#
+# Mapeia o nome usado pelos clientes (tcp_client.py / rudp_client.py via
+# --hostname) para o IP real do container redes_server na rede Docker.
+
+www.redes.ufpi      A    172.20.0.10

@@ -12,12 +12,12 @@ echo -e "${CYAN}==================================================${NC}"
 
 # 1. Recupera as permissões dos arquivos que o Docker criou como root
 echo -e "${YELLOW}[1/3]${NC} Recuperando permissões dos diretórios locais (solicitando sudo)..."
-sudo chown -R $USER:$USER logs/ pcaps/ received_tcp/ received_files/ 2>/dev/null || true
+sudo chown -R $USER:$USER logs/ pcaps/ received_tcp/ received_files/ tests/ 2>/dev/null || true
 
 # 2. Limpa os arquivos internos mantendo a estrutura de pastas
 echo -e "${YELLOW}[2/3]${NC} Apagando arquivos residuais de logs, pcaps e recebidos..."
 rm -rf logs/tcp/* logs/rudp/* pcaps/tcp/* pcaps/rudp/* 2>/dev/null || true
-rm -rf received_tcp/* received_files/* 2>/dev/null || true
+rm -rf received_tcp/* received_files/* tests/* 2>/dev/null || true
 
 # 3. Limpa as regras do tc na interface caso o script tenha caído travado
 echo -e "${YELLOW}[3/4]${NC} Resetando regras do Controle de Tráfego (tc) no container cliente..."

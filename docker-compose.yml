@@ -17,7 +17,29 @@ volumes:
 # Serviços
 services:
 
-  
+  # SERVIDOR DNS LOCAL (UDP nativo, porta 5353)
+   # ---------------------------------------------------------------------------
+  redes_dns:
+    build:
+      context: ./dns_server
+      dockerfile: Dockerfile
+    container_name: redes_dns
+    hostname: redes-dns
+    networks:
+      redes_net:
+        ipv4_address: 172.20.0.12
+    ports:
+      - "5353:5353/udp"   # acessível no host para debug/testes manuais
+    environment:
+      - DNS_PORT=5353
+      - DNS_HOST=0.0.0.0
+      - HOSTS_FILE=/app/hosts.txt
+    volumes:
+      # Permite editar hosts.txt no host e refletir no container sem rebuild
+      - ./dns_server:/app
+    restart: unless-stopped
+
+
   # SERVIDOR — TCP (porta 5001) + R-UDP (porta 9000)
   # ---------------------------------------------------------------------------
   redes_server:
@@ -26,36 +48,30 @@ services:
       dockerfile: Dockerfile
     container_name: redes_server
     hostname: redes-server
-
     networks:
       redes_net:
-        ipv4_address: 172.20.0.10
-
+        ipv4_address: 172.20.0.10   #precisa bater com o IP em dns_server/hosts.txt
     ports:
-      - "5001:5001"    # TCP — acessível no host para debug
-      - "9000:9000/udp"# R-UDP — acessível no host para debug
-
+      - "5001:5001"     # TCP - acessível no host para debug
+      - "9000:9000/udp" # R-UDP - acessível no host para debug
     environment:
       - CONTAINER_ROLE=server
       - MATRICULA=${MATRICULA:-20239000313}
       - NOME_ALUNO=${NOME_ALUNO:-Marcio Rodrigues}
-
     volumes:
       # Arquivos recebidos e logs ficam visíveis no host
       - ./received_tcp:/app/received_tcp
       - ./received_files:/app/received_files
       - ./logs:/app/logs
-
     # Mantém servidor vivo, o script start_servers.sh sobe os dois daemons
     command: ["bash", "/app/start_servers.sh"]
-
+    depends_on:
+      - redes_dns
     restart: unless-stopped
-
     # O servidor não precisa de NET_ADMIN - só recebe pacotes
     cap_add:
       - NET_RAW      # necessário apenas para tcpdump no servidor
 
-  
   # CLIENTE — onde rodam os scripts de teste + tc + tcpdump
   # ---------------------------------------------------------------------------
   redes_client:
@@ -64,32 +80,35 @@ services:
       dockerfile: Dockerfile
     container_name: redes_client
     hostname: redes-client
-
     networks:
       redes_net:
         ipv4_address: 172.20.0.11
-
     environment:
       - CONTAINER_ROLE=client
-      - SERVER_HOST=172.20.0.10
+      - SERVER_HOSTNAME=www.redes.ufpi
       - TCP_PORT=5001
       - RUDP_PORT=9000
+      # Configuracao do modulo DNS local:
+      - DNS_SERVER_HOST=redes_dns
+      - DNS_SERVER_PORT=5353
+      - DNS_TIMEOUT=1.0
+      - DNS_MAX_RETRIES=5
       - MATRICULA=${MATRICULA:-20239000313}
       - NOME_ALUNO=${NOME_ALUNO:-Marcio Rodrigues}
       - ARQUIVO_TESTE=${ARQUIVO_TESTE:-test_payload_1MB.bin}
       - NUM_RUNS=${NUM_RUNS:-15}        # execuções por cenário (10–30)
-
     volumes:
       - ./logs:/app/logs                      # CSVs de métricas
       - ./pcaps:/app/pcaps                    # arquivos .pcap
       - ./graficos_resultado:/app/graficos_resultado  # gráficos PNG
-
+      - ./received_tcp:/app/received_tcp
+      - ./received_files:/app/received_files
+      - ./tests:/app/tests
     # NET_ADMIN: obrigatório para tc qdisc alterar a interface de rede
     # NET_RAW  : obrigatório para tcpdump capturar pacotes raw
     cap_add:
       - NET_ADMIN
       - NET_RAW
-
     # Mantém o container vivo - os testes são disparados manualmente ou via: 
     # docker compose exec redes_client bash /app/rodar_testes.sh
     command: >
@@ -98,8 +117,7 @@ services:
         echo '[CLIENT] Execute: bash /app/rodar_testes.sh' &&
         tail -f /dev/null
       "
-
     depends_on:
+      - redes_dns
       - redes_server
-
     restart: unless-stopped

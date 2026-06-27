@@ -7,6 +7,7 @@ import sys
 import logging
 import time
 import argparse
+from typing import Tuple
 
 # Constantes do protocolo
 # -----------------------------
@@ -14,15 +15,12 @@ FLAG_DATA = 0x01
 FLAG_ACK  = 0x02
 FLAG_FIN  = 0x03
 
-# Formato do cabeçalho: !IBI - network-byte-order | uint32 | uint8 | uint32
 HEADER_FORMAT = "!IBI"
 HEADER_SIZE   = struct.calcsize(HEADER_FORMAT)   # 9 bytes
 
-# Separador que termina o campo X-Custom-Auth no payload
 AUTH_SEPARATOR = b"\n"
 
-# Tempo limite de inatividade para permitir reset de transferências abortadas.
-SERVER_TIMEOUT = 10.0  # segundos
+SERVER_TIMEOUT = 15.0 #segundos
 
 
 # Logging
@@ -38,52 +36,37 @@ log = logging.getLogger("rudp_server")
 # Helpers de cabeçalho
 # -----------------------------
 def build_auth_token(matricula: str, nome: str) -> bytes:
-    """
-    Gera o hash SHA-256 de 'matricula+nome' como token de autenticação
-    O mesmo token deve ser usado pelo cliente
-    """
     raw = (matricula + nome).encode("utf-8")
     return hashlib.sha256(raw).hexdigest().encode("ascii")   # 64 bytes hex
 
 
 def compute_checksum(data: bytes) -> int:
-    """CRC-32 sem sinal sobre os bytes de dados do payload."""
     return binascii.crc32(data) & 0xFFFFFFFF
 
 
 def pack_header(seq_num: int, flag: int, checksum: int) -> bytes:
-    """Empacota os 9 bytes do cabeçalho."""
     return struct.pack(HEADER_FORMAT, seq_num, flag, checksum)
 
 
 def unpack_header(raw: bytes):
-    """
-    Desempacota os primeiros HEADER_SIZE bytes
-    Retorna (seq_num, flag, checksum) ou lança struct.error
-    """
     return struct.unpack(HEADER_FORMAT, raw[:HEADER_SIZE])
 
 
-def parse_packet(raw_packet: bytes):
-    """
-    Decompõe um pacote R-UDP completo em suas partes
+def build_packet(seq_num: int, flag: int, auth_token: bytes, payload: bytes) -> bytes:
+    crc    = compute_checksum(payload)
+    header = pack_header(seq_num, flag, crc)
+    return header + auth_token + AUTH_SEPARATOR + payload
 
-    Retorna:
-    (seq_num, flag, checksum, auth_token, payload)
-    auth_token: bytes com o hash SHA-256 recebido
-    payload: bytes de dados (vazio em ACK/FIN sem dados)
-    Lança ValueError se o pacote for curto demais.
-    """
+
+def parse_packet(raw_packet: bytes):
     if len(raw_packet) < HEADER_SIZE:
         raise ValueError(f"Pacote muito curto: {len(raw_packet)} bytes")
 
     seq_num, flag, checksum = unpack_header(raw_packet)
     rest = raw_packet[HEADER_SIZE:]
 
-    # X-Custom-Auth vai até o primeiro '\n'
     sep_idx = rest.find(AUTH_SEPARATOR)
     if sep_idx == -1:
-        # Pacote sem campo de auth
         auth_token = b""
         payload    = rest
     else:
@@ -93,20 +76,19 @@ def parse_packet(raw_packet: bytes):
     return seq_num, flag, checksum, auth_token, payload
 
 
+def parse_ack(raw_packet: bytes) -> Tuple[int, int]:
+    if len(raw_packet) < HEADER_SIZE:
+        raise ValueError("ACK muito curto")
+    seq_num, flag, _ = unpack_header(raw_packet)
+    return seq_num, flag
+
+
 # Servidor
 # -----------------------------
 
 class RUDPServer:
     """
-    Servidor de transferência de arquivos sobre R-UDP (Stop-and-Wait)
-
-    Parâmetros
-    ----------
-    host         : endereço de bind ('' = todas as interfaces)
-    port         : porta UDP de escuta
-    output_dir   : diretório onde os arquivos recebidos serão salvos
-    matricula    : matrícula do aluno (para validação do X-Custom-Auth)
-    nome         : nome do aluno
+    Servidor HTTP sobre R-UDP (Stop-and-Wait)
     """
 
     def __init__(
@@ -123,12 +105,10 @@ class RUDPServer:
         self.matricula  = matricula
         self.nome       = nome
 
-        # Token de autenticação esperado
         self.expected_auth = build_auth_token(matricula, nome)
 
         os.makedirs(output_dir, exist_ok=True)
 
-        # Cria socket UDP
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((host, port))
@@ -137,169 +117,202 @@ class RUDPServer:
         log.info("Servidor R-UDP aguardando em %s:%d", host or "0.0.0.0", port)
         log.info("Token de auth esperado : %s", self.expected_auth.decode())
 
-    # envio de ACK
     def _send_ack(self, addr: tuple, seq_num: int) -> None:
         """Monta e envia um pacote ACK para o cliente"""
-
-        # ACK não carrega dados, checksum calculado sobre bytes vazios
         ack_payload  = b""
         ack_checksum = compute_checksum(ack_payload)
         header       = pack_header(seq_num, FLAG_ACK, ack_checksum)
-        # X-Custom-Auth também vai no ACK (rastreável no Wireshark)
         ack_packet   = header + self.expected_auth + AUTH_SEPARATOR + ack_payload
         self.sock.sendto(ack_packet, addr)
         log.debug("ACK seq=%d → %s:%d", seq_num, *addr)
 
-    # loop principal ---------- 
-    def serve_forever(self) -> None:
-        """
-        Loop de recepção. Aguarda conexões de clientes indefinidamente
-        Cada transferência completa é tratada em sequência (single-thread)
-        """
-        log.info("Servidor pronto. Aguardando transferências…")
+    def _send_packet_saw(self, client_addr: tuple, packet: bytes, expected_seq: int, max_retries: int = 20) -> None:
+        """Envia `packet` e aguarda ACK com seq == expected_seq via Stop-and-Wait"""
+        timeout = 2.0
+        
+        orig_timeout = self.sock.gettimeout()
+        self.sock.settimeout(timeout)
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.sock.sendto(packet, client_addr)
+                log.debug("[SERVER-SND] → PKT seq=%d (tentativa %d/%d) para %s:%d", expected_seq, attempt, max_retries, *client_addr)
+            except socket.error as err:
+                log.error("Erro ao enviar seq=%d para %s:%d: %s", expected_seq, client_addr[0], client_addr[1], err)
+                break
 
+            # Aguarda ACK
+            while True:
+                try:
+                    raw_ack, addr = self.sock.recvfrom(65535)
+                except socket.timeout:
+                    log.warning("[SERVER-SND] Timeout seq=%d (tentativa %d)", expected_seq, attempt)
+                    break
+                except socket.error as err:
+                    log.error("[SERVER-SND] Erro socket aguardando ACK seq=%d: %s", expected_seq, err)
+                    break
+
+                if addr != client_addr:
+                    continue
+
+                try:
+                    ack_seq, ack_flag = parse_ack(raw_ack)
+                except (ValueError, struct.error) as err:
+                    log.warning("[SERVER-SND] ACK malformado: %s", err)
+                    continue
+
+                if ack_flag != FLAG_ACK:
+                    continue
+
+                if ack_seq != expected_seq:
+                    log.warning("[SERVER-SND] ACK seq=%d ≠ esperado=%d — ignorado.", ack_seq, expected_seq)
+                    continue
+
+                log.debug("[SERVER-SND] ✓ ACK seq=%d recebido.", ack_seq)
+                self.sock.settimeout(orig_timeout)
+                return
+
+        self.sock.settimeout(orig_timeout)
+        raise RuntimeError(f"Falha de retransmissão após {max_retries} tentativas para o seq={expected_seq}")
+
+    def serve_forever(self) -> None:
+        log.info("Servidor pronto. Aguardando transações HTTP/R-UDP…")
         while True:
             try:
-                self._receive_file()
+                self._handle_request()
             except KeyboardInterrupt:
                 log.info("Servidor encerrado pelo usuário.")
                 break
             except Exception as exc:
-                log.error("Erro inesperado: %s — aguardando próxima transferência.", exc)
+                log.error("Erro inesperado: %s — aguardando próxima transação.", exc)
 
         self.sock.close()
 
-    def _receive_file(self) -> None:
-        """
-        Recebe um arquivo completo de um único cliente via Stop-and-Wait
-        Retorna quando a flag FIN é processada ou ocorre um erro fatal
-        """
+    def _handle_request(self) -> None:
+        log.info("Aguardando primeiro pacote da requisição…")
+        
+        client_addr = None
         expected_seq = 0
-        output_path  = None
-        file_handle  = None
-        client_addr  = None
-        total_bytes  = 0
-        start_time   = None
+        request_bytes = b""
 
-        log.info("Aguardando primeiro pacote…")
-
-        try:
-            while True:
-                # recebe datagrama
-                try:
-                    raw_packet, addr = self.sock.recvfrom(65535)
-                except socket.timeout:
-                    if client_addr is None:
-                        continue
-                    log.warning(
-                        "Timeout de recepção para %s:%d — transferênia abortada por inatividade.",
-                        *client_addr,
-                    )
-                    break
-                except socket.error as err:
-                    log.error("Erro de socket ao receber: %s", err)
-                    break
-
-                #registra cliente
+        while True:
+            try:
+                raw_packet, addr = self.sock.recvfrom(65535)
+            except socket.timeout:
                 if client_addr is None:
-                    client_addr = addr
-                    log.info("Nova transferência de %s:%d", *addr)
-                    start_time  = time.time()
+                    continue
+                log.warning("Timeout de inatividade aguardando requisição de %s:%d.", *client_addr)
+                break
+            except socket.error as err:
+                log.error("Erro de socket ao receber: %s", err)
+                break
 
-                # Ignora pacotes de endereços diferentes durante a transferência
-                if addr != client_addr:
-                    log.warning("Pacote ignorado de %s:%d (transferência em curso)", *addr)
+            if client_addr is None:
+                client_addr = addr
+                log.info("Nova requisição HTTP/R-UDP de %s:%d", *addr)
+
+            if addr != client_addr:
+                log.warning("Pacote ignorado de %s:%d (transação em curso)", *addr)
+                continue
+
+            try:
+                seq_num, flag, recv_checksum, auth_token, payload = parse_packet(raw_packet)
+            except (ValueError, struct.error) as err:
+                log.warning("Pacote malformado ignorado: %s", err)
+                continue
+
+            # Valida auth token (apenas log)
+            if auth_token and auth_token != self.expected_auth:
+                log.warning("Token de auth inválido recebido do cliente.")
+
+            # Fim da transmissão do request
+            if flag == FLAG_FIN:
+                log.info("FIN recebido da requisição (seq=%d).", seq_num)
+                self._send_ack(client_addr, seq_num)
+                break
+
+            if flag == FLAG_DATA:
+                calc_checksum = compute_checksum(payload)
+                if calc_checksum != recv_checksum:
+                    log.warning("Checksum INVÁLIDO seq=%d.", seq_num)
                     continue
 
-                # parseia pacote
-                try:
-                    seq_num, flag, recv_checksum, auth_token, payload = parse_packet(raw_packet)
-                except (ValueError, struct.error) as err:
-                    log.warning("Pacote malformado ignorado: %s", err)
-                    continue
-
-                log.debug(
-                    "PKT seq=%d flag=0x%02X crc=0x%08X len_payload=%d",
-                    seq_num, flag, recv_checksum, len(payload),
-                )
-
-                # valida X-Custom-Auth 
-                if auth_token and auth_token != self.expected_auth:
-                    log.warning(
-                        "X-Custom-Auth inválido! recebido=%s esperado=%s",
-                        auth_token.decode(errors="replace"),
-                        self.expected_auth.decode(),
-                    )
-
-                # flag FIN
-                if flag == FLAG_FIN:
-                    log.info("FIN recebido (seq=%d). Encerrando transferência.", seq_num)
+                if seq_num == expected_seq:
+                    request_bytes += payload
+                    self._send_ack(client_addr, seq_num)
+                    expected_seq += 1
+                elif seq_num < expected_seq:
                     self._send_ack(client_addr, seq_num)
 
-                    if file_handle:
-                        file_handle.close()
-                        elapsed = time.time() - start_time
-                        throughput = (total_bytes / elapsed) if elapsed > 0 else 0
-                        log.info(
-                            "Arquivo salvo em '%s' | %d bytes | %.3f s | %.2f KB/s",
-                            output_path,
-                            total_bytes,
-                            elapsed,
-                            throughput / 1024,
-                        )
-                    break  # encerra essa transferência, volta ao loop externo
+        if not request_bytes:
+            log.warning("Nenhum byte de requisição recebido.")
+            return
 
-                # flag DATA
-                if flag == FLAG_DATA:
+        # Processa requisição HTTP GET
+        request_text = request_bytes.decode("utf-8", errors="replace")
+        lines = request_text.split("\r\n")
+        request_line = lines[0]
+        parts = request_line.split()
 
-                    # Abre o arquivo no primeiro pacote de dados (seq == 0)
-                    if file_handle is None:
-                        filename    = f"recv_{int(time.time())}.bin"
-                        output_path = os.path.join(self.output_dir, filename)
-                        file_handle = open(output_path, "wb")
-                        log.info("Gravando em '%s'", output_path)
+        if len(parts) < 3 or parts[0].upper() != "GET":
+            log.warning("Requisição inválida: '%s'", request_line)
+            response_bytes = b"HTTP/1.1 400 Bad Request\r\n\r\n"
+        else:
+            filename = parts[1].lstrip("/")
+            log.info("Recurso solicitado via R-UDP: '%s'", filename)
 
-                    # valida checksum
-                    calc_checksum = compute_checksum(payload)
-                    if calc_checksum != recv_checksum:
-                        log.warning(
-                            "Checksum INVÁLIDO seq=%d (esperado=0x%08X recebido=0x%08X) — NACK implícito (sem ACK)",
-                            seq_num, calc_checksum, recv_checksum,
-                        )
-                        continue
+            if os.path.isfile(filename):
+                file_size = os.path.getsize(filename)
+                header = (
+                    f"HTTP/1.1 200 OK\r\n"
+                    f"Content-Type: application/octet-stream\r\n"
+                    f"Content-Length: {file_size}\r\n"
+                    f"X-Custom-Auth: {self.expected_auth.decode()}\r\n"
+                    f"\r\n"
+                )
+                with open(filename, "rb") as fh:
+                    file_content = fh.read()
+                response_bytes = header.encode("utf-8") + file_content
+                log.info("Servindo arquivo '%s' (%d bytes) via R-UDP.", filename, file_size)
+            else:
+                log.warning("Arquivo '%s' não encontrado (404) via R-UDP.", filename)
+                error_body = "<html><body><h1>404 Not Found</h1></body></html>"
+                header = (
+                    f"HTTP/1.1 404 Not Found\r\n"
+                    f"Content-Type: text/html\r\n"
+                    f"Content-Length: {len(error_body)}\r\n"
+                    f"X-Custom-Auth: {self.expected_auth.decode()}\r\n"
+                    f"\r\n"
+                )
+                response_bytes = header.encode("utf-8") + error_body.encode("utf-8")
 
-                    # valida número de sequência
-                    if seq_num == expected_seq:
-                        file_handle.write(payload)
-                        total_bytes += len(payload)
-                        log.debug("Gravados %d bytes (seq=%d).", len(payload), seq_num)
-                        self._send_ack(client_addr, seq_num)
-                        expected_seq += 1
+        # Envia a resposta HTTP de volta para o cliente usando R-UDP
+        log.info("Enviando resposta HTTP...")
+        chunk_size = 1024
+        total_len = len(response_bytes)
+        offset = 0
+        seq_num = 0
 
-                    elif seq_num < expected_seq:
-                        log.debug("Duplicata seq=%d (esperado=%d) — reenviando ACK.", seq_num, expected_seq)
-                        self._send_ack(client_addr, seq_num)
+        while offset < total_len:
+            chunk = response_bytes[offset:offset+chunk_size]
+            packet = build_packet(seq_num, FLAG_DATA, self.expected_auth, chunk)
+            self._send_packet_saw(client_addr, packet, seq_num)
+            offset += len(chunk)
+            seq_num += 1
 
-                    else:
-                        log.warning("Seq fora de ordem: recebido=%d esperado=%d — ignorado.", seq_num, expected_seq)
-
-                else:
-                    log.warning("Flag desconhecida 0x%02X — pacote ignorado.", flag)
-
-        finally:
-            if file_handle and not file_handle.closed:
-                file_handle.close()
-                log.warning("Handle de arquivo fechado no finally (transferência incompleta?).")
+        # Envia FIN (com limite de retentativas menor para o encerramento)
+        fin_packet = build_packet(seq_num, FLAG_FIN, self.expected_auth, b"")
+        self._send_packet_saw(client_addr, fin_packet, seq_num, max_retries=5)
+        log.info("Transação R-UDP concluída para %s:%d.", *client_addr)
 
 
 # Interface do terminal
 # -----------------------------
-
 def parse_args():
-    p = argparse.ArgumentParser(description="Servidor R-UDP — Redes II UFPI")
+    p = argparse.ArgumentParser(description="Servidor HTTP/R-UDP — Redes II UFPI")
     p.add_argument("--host", default="", help="Interface de bind (padrão: todas)")
     p.add_argument("--port", type=int, default=9000, help="Porta UDP (padrão: 9000)")
-    p.add_argument("--output-dir", default="received_files", help="Diretório de saída dos arquivos")
+    p.add_argument("--output-dir", default="received_files", help="Diretório de saída (não usado em HTTP GET)")
     p.add_argument("--matricula", default="20239000313", help="Matrícula do aluno")
     p.add_argument("--nome", default="Marcio Rodrigues", help="Nome do aluno")
     return p.parse_args()

@@ -8,14 +8,13 @@ import time
 import argparse
 from datetime import datetime
 from typing import Optional
+from dns_client import resolve_dns
 
 # Constantes
 # -------------------------------------
 DEFAULT_HOST    = "127.0.0.1"
 DEFAULT_PORT    = 5001
 CHUNK_SIZE      = 4096         # bytes por envio no stream TCP
-META_TERMINATOR = b"\r\n\r\n"
-RESPONSE_BUFFER = 64           # bytes para ler a resposta OK/AUTH_FAIL
 LOG_FILE        = "logs_tcp.csv"
 
 
@@ -48,47 +47,11 @@ def build_auth_token(matricula: str, nome: str) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def build_metadata(auth_token: str, filename: str, file_size: int) -> bytes:
-    """
-    Monta o bloco de metadados no formato de cabeçalhos HTTP-like:
-        X-Custom-Auth: <sha256hex>\r\n
-        File-Name: <nome_do_arquivo>\r\n
-        File-Size: <bytes>\r\n
-        \r\n
-    """
-    lines = [
-        f"X-Custom-Auth: {auth_token}",
-        f"File-Name: {os.path.basename(filename)}",
-        f"File-Size: {file_size}",
-    ]
-    return ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
-
-
-def recv_response(sock: socket.socket, expected: bytes = b"OK\r\n") -> str:
-    # Lê a resposta do servidor após envio de metadados
-    # Retorna a string recebida (stripped)
-    # Levanta AuthenticationError se o servidor recusar
-
-    raw = b""
-    while not raw.endswith(b"\r\n"):
-        chunk = sock.recv(RESPONSE_BUFFER)
-        if not chunk:
-            raise TCPTransferError("Servidor encerrou a conexão antes de responder.")
-        raw += chunk
-
-    response = raw.strip().decode("utf-8", errors="replace")
-    log.debug("Resposta do servidor: '%s'", response)
-
-    if raw.strip() == b"AUTH_FAIL":
-        raise AuthenticationError("Servidor recusou a autenticação (X-Custom-Auth inválido).")
-    if raw.strip() != b"OK":
-        raise TCPTransferError(f"Resposta inesperada do servidor: '{response}'")
-
-    return response
-
-
 def save_log(record: dict, log_file: str = LOG_FILE) -> None:
     ''' Salva métricas no CSV de log '''
+    log_dir = os.path.dirname(log_file)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
 
     file_exists = os.path.isfile(log_file)
     fieldnames  = [
@@ -109,16 +72,7 @@ def save_log(record: dict, log_file: str = LOG_FILE) -> None:
 # -------------------------------------
 class TCPClient:
     """
-    Cliente TCP de transferência de arquivos com coleta de métricas.
-
-    Parâmetros
-        server_host : IP ou hostname do servidor
-        server_port : porta TCP do servidor
-        matricula   : matrícula do aluno (compõe X-Custom-Auth)
-        nome        : nome do aluno
-        chunk_size  : tamanho de cada bloco de envio (bytes)
-        log_file    : caminho do CSV de métricas
-        scenario    : rótulo do cenário de teste (ex: "A", "B", "C")
+    Cliente TCP de transferência de arquivos (HTTP GET) com coleta de métricas.
     """
 
     def __init__(
@@ -131,7 +85,8 @@ class TCPClient:
         log_file: str    = LOG_FILE,
         scenario: str    = "A",
     ):
-        self.server_addr  = (server_host, server_port)
+        self.server_host  = server_host
+        self.server_port  = server_port
         self.matricula    = matricula
         self.nome         = nome
         self.chunk_size   = chunk_size
@@ -139,95 +94,114 @@ class TCPClient:
         self.scenario     = scenario
         self.auth_token   = build_auth_token(matricula, nome)
 
-        log.info("Cliente TCP → %s:%d", *self.server_addr)
+        log.info("Cliente TCP → %s:%d", self.server_host, self.server_port)
         log.info("X-Custom-Auth : %s", self.auth_token)
 
     # interface
     def send_file(self, filepath: str) -> dict:
         """
-        Envia um arquivo completo ao servidor TCP.
-
-        Retorna
-            dict com métricas:
-            {
-                "timestamp":        str,    # ISO-8601
-                "scenario":         str,    # rótulo do cenário
-                "filename":         str,    # nome do arquivo
-                "file_size_bytes":  int,    # tamanho original
-                "elapsed_s":        float,  # segundos (apenas transferência de dados)
-                "throughput_mbps":  float,  # Megabits por segundo
-                "chunks_sent":      int,    # número de chunks enviados
-            }
-
-        Levanta
-        FileNotFoundError   - arquivo não encontrado
-        TCPTransferError    - falha de conexão ou envio
-        AuthenticationError - servidor recusou auth
+        Requisita um arquivo via HTTP GET e o salva localmente.
+        (Mantido nome 'send_file' para compatibilidade com os scripts de teste).
         """
-        if not os.path.isfile(filepath):
-            raise FileNotFoundError(f"Arquivo não encontrado: {filepath}")
+        filename = os.path.basename(filepath)
+        log.info("Requisitando arquivo via HTTP GET: '%s'", filename)
 
-        file_size = os.path.getsize(filepath)
-        filename  = os.path.basename(filepath)
-        log.info("Arquivo: '%s' | %d bytes", filename, file_size)
+        # 1. Resolução DNS local
+        try:
+            resolved_ip = resolve_dns(self.server_host)
+        except Exception as e:
+            raise TCPTransferError(f"DNS Resolution failed: {e}") from e
 
-        # Monta metadados
-        metadata = build_metadata(self.auth_token, filename, file_size)
+        server_addr = (resolved_ip, self.server_port)
+        log.info("DNS resolvido: %s -> %s", self.server_host, resolved_ip)
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
         try:
-            # Conecta
-            log.info("Conectando a %s:%d…", *self.server_addr)
+            # conecta
+            log.info("Conectando a %s:%d…", *server_addr)
             try:
-                sock.connect(self.server_addr)
+                sock.connect(server_addr)
             except (ConnectionRefusedError, socket.timeout) as err:
                 raise TCPTransferError(f"Falha ao conectar: {err}") from err
 
             log.info("Conexão estabelecida.")
 
-            # Envia metadados
-            log.debug("Enviando metadados (%d bytes)…", len(metadata))
-            sock.sendall(metadata)
+            # Envia HTTP GET request
+            request = f"GET /{filename} HTTP/1.1\r\nHost: {self.server_host}\r\nUser-Agent: HTTPClient\r\n\r\n"
+            sock.sendall(request.encode("utf-8"))
 
-            # Aguarda confirmação do servidor 
-            recv_response(sock)   # levanta AuthenticationError se falhar
-            log.info("Autenticação confirmada pelo servidor. Iniciando transferência…")
+            # Lê cabeçalhos HTTP
+            header_bytes = b""
+            while b"\r\n\r\n" not in header_bytes:
+                chunk = sock.recv(1)
+                if not chunk:
+                    raise TCPTransferError("Conexão encerrada pelo servidor antes dos cabeçalhos.")
+                header_bytes += chunk
 
-            # Transferência de dados 
-            bytes_sent   = 0
-            chunks_sent  = 0
-            t_start      = time.perf_counter()   # início do timer
+            header_part, _, remaining_data = header_bytes.partition(b"\r\n\r\n")
+            headers_str = header_part.decode("utf-8", errors="replace")
+            lines = headers_str.split("\r\n")
 
-            with open(filepath, "rb") as fh:
-                while True:
-                    chunk = fh.read(self.chunk_size)
-                    if not chunk:
-                        break
-                    try:
-                        sock.sendall(chunk)
-                    except socket.error as err:
-                        raise TCPTransferError(f"Erro ao enviar dados: {err}") from err
-                    bytes_sent  += len(chunk)
+            # Status line
+            status_line = lines[0]
+            parts = status_line.split()
+            if len(parts) < 3:
+                raise TCPTransferError(f"Resposta HTTP inválida: {status_line}")
+            status_code = int(parts[1])
+
+            # Parser de cabeçalhos
+            headers = {}
+            for line in lines[1:]:
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    headers[k.strip().lower()] = v.strip()
+
+            if status_code == 404:
+                raise TCPTransferError(f"Erro 404: Arquivo '{filename}' não encontrado no servidor.")
+            elif status_code != 200:
+                raise TCPTransferError(f"Erro HTTP {status_code}: {status_line}")
+
+            content_length = int(headers.get("content-length", 0))
+            server_auth = headers.get("x-custom-auth", "")
+
+            log.info("Cabeçalhos HTTP recebidos | Content-Length=%d | X-Custom-Auth=%s", content_length, server_auth)
+
+            # Recebe o corpo da resposta HTTP 
+            output_dir = "received_tcp"
+            os.makedirs(output_dir, exist_ok=True)
+            saved_path = os.path.join(output_dir, filename)
+
+            bytes_recv = 0
+            chunks_sent = 0
+            t_start = time.perf_counter()
+
+            with open(saved_path, "wb") as fh:
+                if remaining_data:
+                    fh.write(remaining_data)
+                    bytes_recv += len(remaining_data)
                     chunks_sent += 1
-                    log.debug(
-                        "Enviado chunk %d | %d/%d bytes (%.1f%%)",
-                        chunks_sent, bytes_sent, file_size,
-                        100.0 * bytes_sent / file_size if file_size else 100.0,
-                    )
 
-            t_end = time.perf_counter()     # fim do timer
+                while bytes_recv < content_length:
+                    remaining = content_length - bytes_recv
+                    to_read = min(self.chunk_size, remaining)
+                    chunk = sock.recv(to_read)
+                    if not chunk:
+                        raise TCPTransferError("Servidor fechou a conexão prematuramente durante o download.")
+                    fh.write(chunk)
+                    bytes_recv += len(chunk)
+                    chunks_sent += 1
 
-            # Calcula métricas 
-            elapsed         = t_end - t_start
-            throughput_bps  = (bytes_sent * 8) / elapsed if elapsed > 0 else 0
+            t_end = time.perf_counter()
+            elapsed = t_end - t_start
+            throughput_bps = (bytes_recv * 8) / elapsed if elapsed > 0 else 0
             throughput_mbps = throughput_bps / 1_000_000
 
             stats = {
                 "timestamp":       datetime.now().isoformat(timespec="seconds"),
                 "scenario":        self.scenario,
                 "filename":        filename,
-                "file_size_bytes": file_size,
+                "file_size_bytes": bytes_recv,
                 "elapsed_s":       round(elapsed, 6),
                 "throughput_mbps": round(throughput_mbps, 6),
                 "chunks_sent":     chunks_sent,
@@ -245,7 +219,7 @@ class TCPClient:
 
         # Exibe no terminal
         print("\n" + "=" * 50)
-        print("      MÉTRICAS — TRANSFERÊNCIA TCP")
+        print("      MÉTRICAS — TRANSFERÊNCIA HTTP/TCP")
         print("=" * 50)
         print(f"  Arquivo       : {stats['filename']}")
         print(f"  Tamanho       : {stats['file_size_bytes']:,} bytes")
@@ -264,9 +238,9 @@ class TCPClient:
 # Interface do terminal
 # -------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Cliente TCP Baseline — Redes II UFPI")
-    p.add_argument("filepath",                         help="Caminho do arquivo a enviar")
-    p.add_argument("--host",      default=DEFAULT_HOST,help="IP do servidor")
+    p = argparse.ArgumentParser(description="Cliente TCP HTTP/1.1 — Redes II UFPI")
+    p.add_argument("filepath",                         help="Nome do arquivo a requisitar")
+    p.add_argument("--host",      default=DEFAULT_HOST,help="Hostname do servidor")
     p.add_argument("--port",      type=int, default=DEFAULT_PORT, help="Porta TCP")
     p.add_argument("--matricula", default="20239000313", help="Matrícula do aluno")
     p.add_argument("--nome",      default="Marcio Rodrigues",help="Nome do aluno")

@@ -8,8 +8,9 @@ import csv
 import logging
 import time
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Tuple
+from dns_client import resolve_dns
 
 # Constantes do protocolo
 # -----------------------------
@@ -44,13 +45,11 @@ class RUDPTransferError(Exception):
     """Levantada quando a transferência falha irrecuperavelmente"""
 
 
-# Helpers de cabeçalho (idênticos ao servidor)
+# Helpers de cabeçalho
 # -----------------------------
 
 def build_auth_token(matricula: str, nome: str) -> bytes:
-    """
-    Gera o hash SHA-256 de 'matricula+nome'
-    Deve ser idêntico ao token gerado pelo servidor para a mesma identidade
+    """Gera o hash SHA-256 de 'matricula+nome'
     """
     raw = (matricula + nome).encode("utf-8")
     return hashlib.sha256(raw).hexdigest().encode("ascii")   # 64 bytes
@@ -70,26 +69,36 @@ def unpack_header(raw: bytes) -> Tuple[int, int, int]:
 
 
 def build_packet(seq_num: int, flag: int, auth_token: bytes, payload: bytes) -> bytes:
-    """
-    Constrói o pacote completo:
-        [cabeçalho 9 bytes] + [auth_token 64 bytes] + ['\n'] + [payload]
-
-    O checksum é calculado apenas sobre o payload (dados brutos do chunk)
-    """
+    """Constrói o pacote completo"""
     crc    = compute_checksum(payload)
     header = pack_header(seq_num, flag, crc)
     return header + auth_token + AUTH_SEPARATOR + payload
 
 
 def parse_ack(raw_packet: bytes) -> Tuple[int, int]:
-    """
-    Extrai (seq_num, flag) de um pacote ACK recebido
-    Lança ValueError/struct.error se o pacote for inválido
-    """
     if len(raw_packet) < HEADER_SIZE:
         raise ValueError("ACK muito curto")
     seq_num, flag, _ = unpack_header(raw_packet)
     return seq_num, flag
+
+
+def parse_packet(raw_packet: bytes):
+    """Decompõe um pacote R-UDP completo em suas partes"""
+    if len(raw_packet) < HEADER_SIZE:
+        raise ValueError(f"Pacote muito curto: {len(raw_packet)} bytes")
+
+    seq_num, flag, checksum = unpack_header(raw_packet)
+    rest = raw_packet[HEADER_SIZE:]
+
+    sep_idx = rest.find(AUTH_SEPARATOR)
+    if sep_idx == -1:
+        auth_token = b""
+        payload    = rest
+    else:
+        auth_token = rest[:sep_idx]
+        payload    = rest[sep_idx + len(AUTH_SEPARATOR):]
+
+    return seq_num, flag, checksum, auth_token, payload
 
 
 def save_log(record: dict, log_file: str = LOG_FILE) -> None:
@@ -124,16 +133,7 @@ def save_log(record: dict, log_file: str = LOG_FILE) -> None:
 
 class RUDPClient:
     """
-    Cliente de transferência de arquivos sobre R-UDP (Stop-and-Wait)
-
-    Parâmetros
-        server_host : endereço IP ou hostname do servidor
-        server_port : porta UDP do servidor
-        matricula   : matrícula de aluno (compõe o X-Custom-Auth)
-        nome        : nome de aluno
-        timeout     : segundos de espera por ACK
-        max_retries : tentativas máximas antes de falhar
-        chunk_size  : tamanho de cada fragmento de dados em bytes
+    Cliente HTTP sobre R-UDP (Stop-and-Wait)
     """
 
     def __init__(
@@ -148,7 +148,8 @@ class RUDPClient:
         scenario: str     = "A",
         log_file: str     = LOG_FILE,
     ):
-        self.server_addr  = (server_host, server_port)
+        self.server_host  = server_host
+        self.server_port  = server_port
         self.matricula    = matricula
         self.nome         = nome
         self.timeout      = timeout
@@ -157,194 +158,28 @@ class RUDPClient:
         self.scenario     = scenario
         self.log_file     = log_file
 
-        # Token gerado uma única vez para toda a sessão
         self.auth_token   = build_auth_token(matricula, nome)
 
-        # Cria socket UDP, timeout definido uma vez para toda a sessão
+        # Cria socket UDP, timeout dinâmico
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(self.timeout)
 
-        log.info("Cliente R-UDP → %s:%d", *self.server_addr)
+        # Usado para enviar requisição (endereço IP resolvido dinamicamente)
+        self.server_addr  = (server_host, server_port)
+
+        log.info("Cliente HTTP/R-UDP → %s:%d", self.server_host, self.server_port)
         log.info("X-Custom-Auth : %s", self.auth_token.decode())
 
-    # Stop-and-Wait: envia e aguarda ACK 
-    def _send_and_wait_ack(self, packet: bytes, expected_seq: int) -> None:
-        """
-        Envia `packet` e aguarda ACK com seq == expected_seq
-
-        Repete até MAX_RETRIES vezes em caso de timeout ou ACK duplicado
-        Levanta RUDPTransferError se todas as tentativas falharem
-        """
-        for attempt in range(1, self.max_retries + 1):
-            # envia 
-            try:
-                self.sock.sendto(packet, self.server_addr)
-                log.debug("Enviado seq=%d (tentativa %d/%d)", expected_seq, attempt, self.max_retries)
-            except socket.error as err:
-                raise RUDPTransferError(f"Erro ao enviar pacote seq={expected_seq}: {err}") from err
-
-            # aguarda ACK 
-            while True:
-                try:
-                    raw_ack, addr = self.sock.recvfrom(65535)
-                except socket.timeout:
-                    log.warning("Timeout esperando ACK seq=%d (tentativa %d)", expected_seq, attempt)
-                    break
-                except socket.error as err:
-                    raise RUDPTransferError(f"Erro de socket ao aguardar ACK: {err}") from err
-
-                # parseia ACK (extrai/interpreta mensagem)
-                try:
-                    ack_seq, ack_flag = parse_ack(raw_ack)
-                except (ValueError, struct.error) as err:
-                    log.warning("ACK malformado ignorado: %s", err)
-                    continue
-
-                if ack_flag != FLAG_ACK:
-                    log.warning("Pacote recebido não é ACK (flag=0x%02X) — ignorado.", ack_flag)
-                    continue
-
-                if ack_seq != expected_seq:
-                    log.warning(
-                        "ACK fora de ordem: recebido seq=%d esperado seq=%d — ignorado.",
-                        ack_seq, expected_seq,
-                    )
-                    continue
-
-                # ACK correto recebido
-                log.debug("ACK seq=%d confirmado.", ack_seq)
-                return 
-
-        # esgotou as tentativas (sem sucesso)
-        raise RUDPTransferError(
-            f"Máximo de retransmissões ({self.max_retries}) atingido para seq={expected_seq}."
-        )
-
-    # interface
-    def send_file(self, filepath: str) -> dict:
-        """
-        Envia um arquivo completo ao servidor via Stop-and-Wait
-
-        Retorna:
-            dict com métricas da transferência:
-            {
-                "file":        str,    # caminho do arquivo
-                "bytes_sent":  int,    # bytes de dados enviados
-                "chunks":      int,    # número de chunks
-                "retransmits": int,    # total de retransmissões
-                "elapsed":     float,  # segundos totais
-                "throughput":  float,  # bytes/segundo
-            }
-
-        Levanta:
-            FileNotFoundError - se o arquivo não existir
-            RUDPTransferError - se a transferência falhar
-        """
-        if not os.path.isfile(filepath):
-            raise FileNotFoundError(f"Arquivo não encontrado: {filepath}")
-
-        file_size = os.path.getsize(filepath)
-        log.info("Iniciando envio de '%s' (%d bytes)", filepath, file_size)
-
-        seq_num      = 0
-        bytes_sent   = 0
-        chunks_count = 0
-        retransmits  = 0
-        start_time   = time.time()
-
-        try:
-            with open(filepath, "rb") as fh:
-                while True:
-                    chunk = fh.read(self.chunk_size)
-                    if not chunk:
-                        break 
-
-                    # monta pacote DATA 
-                    packet = build_packet(seq_num, FLAG_DATA, self.auth_token, chunk)
-
-                    # envia com Stop-and-wait 
-                    attempts_before = self._retransmit_counter
-                    self._send_packet_saw(packet, seq_num)
-                    retransmits += (self._retransmit_counter - attempts_before)
-
-                    bytes_sent   += len(chunk)
-                    chunks_count += 1
-                    seq_num      += 1
-
-                    log.info(
-                        "Progresso: %.1f%% (%d/%d bytes) | seq=%d",
-                        100.0 * bytes_sent / file_size if file_size else 100.0,
-                        bytes_sent, file_size, seq_num - 1,
-                    )
-
-            # envia FIN 
-            log.info("Enviando FIN (seq=%d)…", seq_num)
-            fin_packet = build_packet(seq_num, FLAG_FIN, self.auth_token, b"")
-            self._send_and_wait_ack(fin_packet, seq_num)
-            log.info("FIN confirmado pelo servidor.")
-
-        except RUDPTransferError as err:
-            elapsed    = time.time() - start_time
-            throughput = bytes_sent / elapsed if elapsed > 0 else 0
-
-            log_record = {
-                "timestamp":       datetime.utcnow().isoformat() + "Z",
-                "scenario":        self.scenario,
-                "filename":        os.path.basename(filepath),
-                "file_size_bytes": file_size,
-                "elapsed_s":       elapsed,
-                "throughput_mbps": (throughput * 8) / 1_000_000,
-                "chunks_sent":     chunks_count,
-                "retransmits":     retransmits,
-            }
-            save_log(log_record, self.log_file)
-
-            log.error("Transferência abortada por falha no Stop-and-Wait.")
-            raise
-
-        elapsed    = time.time() - start_time
-        throughput = bytes_sent / elapsed if elapsed > 0 else 0
-
-        stats = {
-            "file":        filepath,
-            "bytes_sent":  bytes_sent,
-            "chunks":      chunks_count,
-            "retransmits": retransmits,
-            "elapsed":     elapsed,
-            "throughput":  throughput,
-        }
-
-        log_record = {
-            "timestamp":       datetime.utcnow().isoformat() + "Z",
-            "scenario":        self.scenario,
-            "filename":        os.path.basename(filepath),
-            "file_size_bytes": file_size,
-            "elapsed_s":       elapsed,
-            "throughput_mbps": (throughput * 8) / 1_000_000,
-            "chunks_sent":     chunks_count,
-            "retransmits":     retransmits,
-        }
-        save_log(log_record, self.log_file)
-
-        log.info(
-            "Transferência concluída | %d bytes | %d chunks | %d retransmissões | "
-            "%.3f s | %.2f KB/s",
-            bytes_sent, chunks_count, retransmits, elapsed, throughput / 1024,
-        )
-
-        return stats
-
-    # contador interno de retransmissões
-    @property
-    def _retransmit_counter(self) -> int:
-        """Contador interno acumulado - inicializado no __init__"""
-        return getattr(self, "_rtx_count", 0)
+    def _send_ack(self, addr: tuple, seq_num: int) -> None:
+        """Monta e envia um pacote ACK para o servidor"""
+        ack_payload  = b""
+        ack_checksum = compute_checksum(ack_payload)
+        header       = pack_header(seq_num, FLAG_ACK, ack_checksum)
+        ack_packet   = header + self.auth_token + AUTH_SEPARATOR + ack_payload
+        self.sock.sendto(ack_packet, addr)
 
     def _send_packet_saw(self, packet: bytes, expected_seq: int) -> None:
-        """
-        Wrapper de _send_and_wait_ack que contabiliza retransmissões
-        Cada chamada após a primeira (tentativa 1) incrementa _rtx_count.
-        """
+        """Envia `packet` e aguarda ACK com seq == expected_seq com Stop-and-Wait"""
         if not hasattr(self, "_rtx_count"):
             self._rtx_count = 0
 
@@ -389,19 +224,204 @@ class RUDPClient:
             f"Falha após {self.max_retries} tentativas no seq={expected_seq}."
         )
 
+    # interface
+    def send_file(self, filepath: str) -> dict:
+        """
+        Requisita um arquivo via HTTP GET sobre R-UDP.
+        """
+        filename = os.path.basename(filepath)
+        log.info("Iniciando requisição HTTP/R-UDP de '%s'", filename)
+
+        # Resolução DNS
+        try:
+            resolved_ip = resolve_dns(self.server_host)
+        except Exception as e:
+            raise RUDPTransferError(f"DNS Resolution failed: {e}") from e
+
+        self.server_addr = (resolved_ip, self.server_port)
+        log.info("DNS resolvido: %s -> %s", self.server_host, resolved_ip)
+
+        self._rtx_count = 0
+        start_time = time.time()
+
+        try:
+            # Envia HTTP GET request via R-UDP
+            request_str = f"GET /{filename} HTTP/1.1\r\nHost: {self.server_host}\r\nUser-Agent: HTTPClient\r\n\r\n"
+            request_bytes = request_str.encode("utf-8")
+            
+            req_packet = build_packet(0, FLAG_DATA, self.auth_token, request_bytes)
+            self._send_packet_saw(req_packet, 0)
+            
+            fin_packet = build_packet(1, FLAG_FIN, self.auth_token, b"")
+            self._send_packet_saw(fin_packet, 1)
+
+            # Transição para receptor: aguarda resposta do servidor
+            log.info("Requisição enviada. Aguardando resposta HTTP do servidor via R-UDP...")
+            
+            response_bytes = b""
+            expected_seq = 0
+            chunks_received = 0
+            timeout_count = 0
+            
+            # Define um timeout temporário de 10s para a recepção dos dados, evitando warnings espúrios 
+            # de timeouts causados pelas retransmissões do servidor (que ocorrem a cada 2s).
+            self.sock.settimeout(10.0)
+            
+            while True:
+                try:
+                    raw_packet, addr = self.sock.recvfrom(65535)
+                    timeout_count = 0
+                except socket.timeout:
+                    timeout_count += 1
+                    log.warning("Timeout aguardando pacote de dados do servidor (inatividade %d/10)", timeout_count)
+                    if timeout_count >= 10:
+                        raise RUDPTransferError("Conexão perdida com o servidor (timeout de inatividade).")
+                    continue
+                except socket.error as err:
+                    raise RUDPTransferError(f"Erro de socket ao receber resposta: {err}") from err
+
+                try:
+                    seq_num, flag, recv_checksum, auth_token, payload = parse_packet(raw_packet)
+                except (ValueError, struct.error) as err:
+                    log.warning("Pacote malformado ignorado: %s", err)
+                    continue
+
+                if flag == FLAG_FIN:
+                    log.info("FIN recebido do servidor (seq=%d). Encerrando recepção.", seq_num)
+                    self._send_ack(addr, seq_num)
+                    
+                    # Estado TIME_WAIT simplificado para garantir a entrega do ACK final ao servidor
+                    log.info("Entrando em estado TIME_WAIT (1.5s)...")
+                    time_wait_start = time.time()
+                    self.sock.settimeout(0.3)
+                    while time.time() - time_wait_start < 1.5:
+                        try:
+                            tw_packet, tw_addr = self.sock.recvfrom(65535)
+                            try:
+                                tw_seq, tw_flag, _, _, _ = parse_packet(tw_packet)
+                                if tw_flag == FLAG_FIN:
+                                    log.debug("Retransmissão de FIN do servidor detectada no TIME_WAIT. Reenviando ACK.")
+                                    self._send_ack(tw_addr, tw_seq)
+                            except Exception:
+                                pass
+                        except socket.timeout:
+                            continue
+                        except Exception:
+                            break
+                    break
+
+                if flag == FLAG_DATA:
+                    calc_checksum = compute_checksum(payload)
+                    if calc_checksum != recv_checksum:
+                        log.warning("Checksum INVÁLIDO seq=%d. Ignorando.", seq_num)
+                        continue
+
+                    if seq_num == expected_seq:
+                        response_bytes += payload
+                        self._send_ack(addr, seq_num)
+                        expected_seq += 1
+                        chunks_received += 1
+                    elif seq_num < expected_seq:
+                        self._send_ack(addr, seq_num)
+            
+            # Restaura o timeout original do socket
+            self.sock.settimeout(self.timeout)
+
+            # Processa a resposta HTTP
+            if not response_bytes:
+                raise RUDPTransferError("Nenhuma resposta HTTP recebida do servidor.")
+
+            header_part, _, body_part = response_bytes.partition(b"\r\n\r\n")
+            headers_str = header_part.decode("utf-8", errors="replace")
+            lines = headers_str.split("\r\n")
+
+            status_line = lines[0]
+            parts = status_line.split()
+            if len(parts) < 3:
+                raise RUDPTransferError(f"Resposta HTTP inválida do servidor: {status_line}")
+            
+            status_code = int(parts[1])
+
+            headers = {}
+            for line in lines[1:]:
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    headers[k.strip().lower()] = v.strip()
+
+            if status_code == 404:
+                raise RUDPTransferError(f"Erro 404: Arquivo '{filename}' não encontrado no servidor.")
+            elif status_code != 200:
+                raise RUDPTransferError(f"Erro HTTP {status_code}: {status_line}")
+
+            # Salva o arquivo recebido
+            output_dir = "received_files"
+            os.makedirs(output_dir, exist_ok=True)
+            saved_path = os.path.join(output_dir, filename)
+
+            with open(saved_path, "wb") as fh:
+                fh.write(body_part)
+
+            file_size = len(body_part)
+            log.info("Download concluído com sucesso. Salvo em '%s' (%d bytes).", saved_path, file_size)
+
+        except RUDPTransferError as err:
+            elapsed    = time.time() - start_time
+            log_record = {
+                "timestamp":       datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "scenario":        self.scenario,
+                "filename":        filename,
+                "file_size_bytes": 0,
+                "elapsed_s":       elapsed,
+                "throughput_mbps": 0.0,
+                "chunks_sent":     0,
+                "retransmits":     self._retransmit_counter,
+            }
+            save_log(log_record, self.log_file)
+            log.error("Transferência HTTP/R-UDP falhou.")
+            raise
+
+        elapsed    = time.time() - start_time
+        throughput = file_size / elapsed if elapsed > 0 else 0
+
+        stats = {
+            "file":        filepath,
+            "bytes_sent":  file_size,
+            "chunks":      chunks_received,
+            "retransmits": self._retransmit_counter,
+            "elapsed":     elapsed,
+            "throughput":  throughput,
+        }
+
+        log_record = {
+            "timestamp":       datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "scenario":        self.scenario,
+            "filename":        filename,
+            "file_size_bytes": file_size,
+            "elapsed_s":       elapsed,
+            "throughput_mbps": (throughput * 8) / 1_000_000,
+            "chunks_sent":     chunks_received,
+            "retransmits":     self._retransmit_counter,
+        }
+        save_log(log_record, self.log_file)
+
+        return stats
+
+    @property
+    def _retransmit_counter(self) -> int:
+        return getattr(self, "_rtx_count", 0)
+
     def close(self) -> None:
         """Fecha o socket UDP"""
         self.sock.close()
-        log.info("Socket fechado.")
+        log.info("Socket RUDP fechado.")
 
 
 # Interface de terminal
 # -----------------------------
-
 def parse_args():
-    p = argparse.ArgumentParser(description="Cliente R-UDP — Redes II UFPI")
-    p.add_argument("filepath",               help="Caminho do arquivo a enviar")
-    p.add_argument("--host",    default="127.0.0.1", help="IP do servidor (padrão: 127.0.0.1)")
+    p = argparse.ArgumentParser(description="Cliente HTTP/R-UDP — Redes II UFPI")
+    p.add_argument("filepath",               help="Nome do arquivo a requisitar")
+    p.add_argument("--host",    default="127.0.0.1", help="Hostname do servidor")
     p.add_argument("--port",    type=int, default=9000, help="Porta UDP (padrão: 9000)")
     p.add_argument("--matricula", default="20239000313", help="Matrícula do aluno")
     p.add_argument("--nome",      default="Marcio Rodrigues",help="Nome do aluno")
@@ -435,7 +455,7 @@ if __name__ == "__main__":
         stats = client.send_file(args.filepath)
         print("\n===== ESTATÍSTICAS DA TRANSFERÊNCIA =====")
         print(f"  Arquivo       : {stats['file']}")
-        print(f"  Bytes enviados: {stats['bytes_sent']:,}")
+        print(f"  Bytes recebidos: {stats['bytes_sent']:,}")
         print(f"  Chunks        : {stats['chunks']}")
         print(f"  Retransmissões: {stats['retransmits']}")
         print(f"  Tempo total   : {stats['elapsed']:.4f} s")

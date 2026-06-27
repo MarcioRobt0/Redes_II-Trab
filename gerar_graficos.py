@@ -283,11 +283,6 @@ def grafico_throughput(df: pd.DataFrame, output_dir: Path) -> Path:
     )
     ax.set_xlabel("Cenários de Rede", fontsize=FONT_AXIS, labelpad=8)
     ax.set_ylabel("Throughput (Mbps)", fontsize=FONT_AXIS, labelpad=8)
-    ax.set_title(
-        "Gráfico 1 — Throughput Médio por Cenário: TCP vs R-UDP\n"
-        "(barras de erro = desvio padrão das amostras)",
-        fontsize=FONT_TITLE, fontweight="bold", pad=14,
-    )
 
     # Grid apenas no eixo Y
     ax.grid(axis="y", linestyle="--", alpha=ALPHA_GRID, zorder=0)
@@ -403,11 +398,6 @@ def grafico_tempo(df: pd.DataFrame, output_dir: Path) -> Path:
     )
     ax.set_xlabel("Cenários de Rede", fontsize=FONT_AXIS, labelpad=8)
     ax.set_ylabel("Tempo de Transferência (s)", fontsize=FONT_AXIS, labelpad=8)
-    ax.set_title(
-        "Gráfico 2 — Tempo Médio de Transferência por Cenário: TCP vs R-UDP\n"
-        "(barras de erro = desvio padrão das amostras)",
-        fontsize=FONT_TITLE, fontweight="bold", pad=14,
-    )
 
     ax.grid(axis="y", linestyle="--", alpha=ALPHA_GRID, zorder=0)
     ax.set_axisbelow(True)
@@ -552,10 +542,6 @@ def grafico_discrepancia(df: pd.DataFrame, output_dir: Path) -> Path:
     )
     ax1.set_xlabel("Cenários de Rede", fontsize=FONT_AXIS, labelpad=8)
     ax1.set_ylabel("Tempo (s)", fontsize=FONT_AXIS, labelpad=8)
-    ax1.set_title(
-        "(a) Tempo Médio: Aplicação vs Rede\n(barras hachuradas = medição de rede/pcap)",
-        fontsize=FONT_TICK + 1, pad=10,
-    )
     ax1.grid(axis="y", linestyle="--", alpha=ALPHA_GRID, zorder=0)
     ax1.set_axisbelow(True)
     ax1.legend(
@@ -624,11 +610,6 @@ def grafico_discrepancia(df: pd.DataFrame, output_dir: Path) -> Path:
 
     ax2.set_xlabel("Cenários de Rede", fontsize=FONT_AXIS, labelpad=8)
     ax2.set_ylabel("Discrepância Δt (%)", fontsize=FONT_AXIS, labelpad=8)
-    ax2.set_title(
-        "(b) Discrepância Tempo Aplicação vs Rede\n"
-        "(faixa sombreada = ±1 desvio padrão)",
-        fontsize=FONT_TICK + 1, pad=10,
-    )
     ax2.grid(linestyle="--", alpha=ALPHA_GRID, zorder=0)
     ax2.set_axisbelow(True)
     ax2.legend(
@@ -720,12 +701,6 @@ def grafico_tabela_resumo(df: pd.DataFrame, output_dir: Path) -> Path:
         cor_linha = "#d6eaf8" if proto_val == "TCP" else "#fde8e8"
         for j in range(len(col_labels)):
             tabela[i, j].set_facecolor(cor_linha)
-
-    ax.set_title(
-        "Tabela Resumo — Estatísticas Completas de Throughput e Tempo\n"
-        "Redes de Computadores II — UFPI · Análise TCP vs R-UDP",
-        fontsize=FONT_TITLE, fontweight="bold", pad=20, y=0.98,
-    )
 
     plt.tight_layout()
 
@@ -874,7 +849,6 @@ def main():
                 fig, ax = plt.subplots(figsize=(14, 8))
                 ax.imshow(img)
                 ax.axis("off")
-                ax.set_title(arq.name, fontsize=10)
                 plt.tight_layout()
             plt.show()
         except Exception as e:

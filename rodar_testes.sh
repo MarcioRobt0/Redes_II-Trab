@@ -1,7 +1,7 @@
 set -euo pipefail   # sai imediatamente em qualquer erro não tratado
 
 # Configurações - lidas do ambiente (definidas no docker-compose.yml) ou com fallback para valores padrão
-SERVER_HOST="${SERVER_HOST:-172.20.0.10}"
+SERVER_HOST="${SERVER_HOSTNAME:-www.redes.ufpi}"
 TCP_PORT="${TCP_PORT:-5001}"
 RUDP_PORT="${RUDP_PORT:-9000}"
 MATRICULA="${MATRICULA:-20239000313}"
@@ -11,8 +11,16 @@ NUM_RUNS="${NUM_RUNS:-15}"         # execuções por cenário (10–30)
 IFACE="${IFACE:-eth0}"             # interface de rede do container
 
 APP_DIR="/app"
-LOG_DIR="${APP_DIR}/logs"
-PCAP_DIR="${APP_DIR}/pcaps"
+
+FILE_BASENAME=$(basename "${ARQUIVO_TESTE}")
+SIZE_LABEL=$(echo "${FILE_BASENAME}" | sed -E 's/test_payload_(.*)\.bin/\1/')
+if [[ "${SIZE_LABEL}" == "${FILE_BASENAME}" ]]; then
+    SIZE_LABEL="outros"
+fi
+
+TEST_BASE_DIR="${APP_DIR}/tests/${SIZE_LABEL}"
+LOG_DIR="${TEST_BASE_DIR}/logs"
+PCAP_DIR="${TEST_BASE_DIR}/pcaps"
 
 # --------------------------------------
 # Cores para output legível no terminal
@@ -215,14 +223,17 @@ pre_check() {
     # Servidor TCP acessível?
     if ! python3 -c "
         import socket, sys
+        sys.path.append('${APP_DIR}')
+        from dns_client import resolve_dns
         s = socket.socket()
         s.settimeout(3)
         try:
-        s.connect(('${SERVER_HOST}', ${TCP_PORT}))
-        s.close()
-        sys.exit(0)
-        except:
-        sys.exit(1)
+            ip = resolve_dns('${SERVER_HOST}')
+            s.connect((ip, ${TCP_PORT}))
+            s.close()
+            sys.exit(0)
+        except Exception as e:
+            sys.exit(1)
         " 2>/dev/null; then
         log_warn "Servidor TCP (${SERVER_HOST}:${TCP_PORT}) não respondeu — verifique se o servidor está rodando."
         log_warn "Continuando mesmo assim (pode falhar nos testes TCP)."
@@ -282,7 +293,11 @@ main() {
     log_info "Logs R-UDP     : ${LOG_DIR}/rudp/"
     log_info "Capturas .pcap : ${PCAP_DIR}/"
     log_info ""
-    log_info "Próximo passo  : python3 validacao_cruzada.py"
+    log_info "Próximos passos sugeridos:"
+    log_info "  1. Rodar validação cruzada:"
+    log_info "     python3 validacao_cruzada.py --base-dir ${TEST_BASE_DIR} --output logs/dados/metricas_${SIZE_LABEL}.csv"
+    log_info "  2. Gerar gráficos para este tamanho:"
+    log_info "     python3 gerar_graficos.py --csv logs/dados/metricas_${SIZE_LABEL}.csv --out graficos_resultado/${SIZE_LABEL}"
 }
 
 main "$@"

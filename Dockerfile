@@ -57,7 +57,9 @@ RUN mkdir -p /app/received_tcp \
 
 
 # 5. Gera o arquivo de teste se não existir
-RUN python3 gerar_arquivo_teste.py --size 1
+RUN python3 gerar_arquivo_teste.py --size 0.095367 --name test_payload_100KB.bin && \
+    python3 gerar_arquivo_teste.py --size 1 && \
+    python3 gerar_arquivo_teste.py --size 10
 
 
 # 6. Ponto de entrada padrão — substituído pelo command: no compose

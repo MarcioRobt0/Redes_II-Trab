@@ -12,9 +12,7 @@ from typing import Optional
 # ------------------------- 
 DEFAULT_HOST        = ""          # bind em todas as interfaces
 DEFAULT_PORT        = 5001
-RECV_BUFFER         = 4096        # bytes por recvfrom no corpo do arquivo
-META_BUFFER         = 4096        # bytes máximos para o bloco de metadados
-META_TERMINATOR     = b"\r\n\r\n"
+RECV_BUFFER         = 4096
 OUTPUT_DIR          = "received_tcp"
 
 
@@ -37,155 +35,88 @@ def build_auth_token(matricula: str, nome: str) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def parse_metadata(raw: bytes) -> dict:
-    """
-    Parseia o bloco de metadados enviado pelo cliente
-
-    Formato esperado (terminado em b'\\r\\n\\r\\n'):
-        X-Custom-Auth: <valor>\r\n
-        File-Name: <nome>\r\n
-        File-Size: <int>\r\n
-
-    Retorna dict com chaves em minúsculas: 'x-custom-auth', 'file-name', 'file-size'
-    Levanta ValueError se algum campo obrigatório estiver ausente
-    """
-
-    # Remove o terminador e divide em linhas
-    text  = raw.rstrip(b"\r\n").decode("utf-8", errors="replace")
-    lines = [l.strip() for l in text.split("\r\n") if l.strip()]
-
-    fields: dict = {}
-    for line in lines:
-        if ":" not in line:
-            continue
-        key, _, value = line.partition(":")
-        fields[key.strip().lower()] = value.strip()
-
-    required = ("x-custom-auth", "file-name", "file-size")
-    missing  = [f for f in required if f not in fields]
-    if missing:
-        raise ValueError(f"Metadados incompletos. Faltando: {missing}")
-
-    fields["file-size"] = int(fields["file-size"])
-    return fields
-
-
-def recvall_until(sock: socket.socket, terminator: bytes, max_bytes: int = META_BUFFER) -> bytes:
-    """
-    Lê do socket byte a byte (ou em pequenos buffers) até encontrar `terminator`
-    ou atingir `max_bytes`
-
-    Retorna os bytes lidos (incluindo o terminador) ou levanta RuntimeError
-    """
-    buf = b""
-    while len(buf) < max_bytes:
-        chunk = sock.recv(1)
-        if not chunk:
-            raise RuntimeError("Conexão encerrada antes de receber metadados completos.")
-        buf += chunk
-        if buf.endswith(terminator):
-            return buf
-    raise RuntimeError(f"Metadados excederam {max_bytes} bytes sem encontrar terminador.")
-
-
 # Handler de cada conexão (thread isolada)
 # -------------------------
-def handle_client(conn: socket.socket, addr: tuple, expected_auth: str, output_dir: str) -> None:
+def handle_client(conn: socket.socket, addr: tuple, expected_auth: str) -> None:
     """
-    Processa uma conexão TCP completa:
-      1. Lê e valida metadados
-      2. Recebe o arquivo
-      3. Salva no disco e loga métricas
-
-    Executado em thread separada para permitir conexões simultâneas
+    Processa uma conexão HTTP TCP completa:
+      1. Lê e interpreta a requisição HTTP GET
+      2. Valida o recurso solicitado
+      3. Responde com 200 OK + arquivo ou 404 Not Found.
     """
     log.info("Conexão recebida de %s:%d", *addr)
     start_time   = time.perf_counter()
-    file_handle  = None
-    saved_path   = None
 
     try:
-        # Lê metadados
-        try:
-            raw_meta = recvall_until(conn, META_TERMINATOR)
-        except RuntimeError as err:
-            log.error("Erro lendo metadados: %s", err)
-            return
-
-        try:
-            meta = parse_metadata(raw_meta)
-        except ValueError as err:
-            log.error("Metadados inválidos: %s", err)
-            conn.sendall(b"AUTH_FAIL\r\n")
-            return
-
-        log.info(
-            "Metadados recebidos | arquivo='%s' | tamanho=%d bytes | auth='%s…'",
-            meta["file-name"],
-            meta["file-size"],
-            meta["x-custom-auth"][:16],
-        )
-
-        # Valida X-Custom-Auth 
-        if meta["x-custom-auth"] != expected_auth:
-            log.warning(
-                "AUTH FALHOU | recebido=%s | esperado=%s",
-                meta["x-custom-auth"],
-                expected_auth,
-            )
-            conn.sendall(b"AUTH_FAIL\r\n")
-            return
-
-        log.info("Autenticação OK.")
-        conn.sendall(b"OK\r\n")
-
-        # Recebe o arquivo
-        file_size  = meta["file-size"]
-        safe_name  = os.path.basename(meta["file-name"]) or f"recv_{int(time.time())}.bin"
-        saved_path = os.path.join(output_dir, safe_name)
-
-        bytes_recv = 0
-        file_handle = open(saved_path, "wb")
-
-        data_start = time.perf_counter()   # mede apenas o tempo de transferência de dados
-
-        while bytes_recv < file_size:
-            remaining = file_size - bytes_recv
-            to_read   = min(RECV_BUFFER, remaining)
-            chunk     = conn.recv(to_read)
+        # Lê a requisição HTTP até achar o terminador \r\n\r\n
+        req_data = b""
+        while b"\r\n\r\n" not in req_data:
+            chunk = conn.recv(1024)
             if not chunk:
-                log.warning("Conexão encerrada prematuramente (%d/%d bytes).", bytes_recv, file_size)
                 break
-            file_handle.write(chunk)
-            bytes_recv += len(chunk)
+            req_data += chunk
 
-        data_end = time.perf_counter()
+        if not req_data:
+            log.warning("Conexão fechada sem dados de requisição.")
+            return
 
-        file_handle.close()
-        file_handle = None
+        request_text = req_data.decode("utf-8", errors="replace")
+        lines = request_text.split("\r\n")
+        request_line = lines[0]
+        parts = request_line.split()
 
-        # Métricas 
-        total_elapsed = data_end - data_start
-        throughput_bps  = (bytes_recv * 8) / total_elapsed if total_elapsed > 0 else 0
-        throughput_mbps = throughput_bps / 1_000_000
+        if len(parts) < 3 or parts[0].upper() != "GET":
+            log.warning("Requisição inválida ou método não suportado: '%s'", request_line)
+            # Retorna 400 Bad Request simplificado
+            conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            return
 
-        if bytes_recv == file_size:
-            log.info(
-                "Arquivo '%s' recebido com sucesso | %d bytes | %.4f s | %.4f Mbps",
-                saved_path, bytes_recv, total_elapsed, throughput_mbps,
+        path = parts[1]
+        filename = path.lstrip("/")
+        
+        log.info("Recurso solicitado: '%s'", filename)
+
+        if os.path.isfile(filename):
+            file_size = os.path.getsize(filename)
+            # Constrói cabeçalho 200 OK
+            header = (
+                f"HTTP/1.1 200 OK\r\n"
+                f"Content-Type: application/octet-stream\r\n"
+                f"Content-Length: {file_size}\r\n"
+                f"X-Custom-Auth: {expected_auth}\r\n"
+                f"\r\n"
             )
+            conn.sendall(header.encode("utf-8"))
+
+            # Envia conteúdo do arquivo em chunks
+            bytes_sent = 0
+            with open(filename, "rb") as fh:
+                while True:
+                    chunk = fh.read(RECV_BUFFER)
+                    if not chunk:
+                        break
+                    conn.sendall(chunk)
+                    bytes_sent += len(chunk)
+            
+            elapsed = time.perf_counter() - start_time
+            log.info("Servido '%s' (%d bytes) com sucesso em %.4f s.", filename, bytes_sent, elapsed)
+
         else:
-            log.warning(
-                "Arquivo INCOMPLETO '%s' | %d/%d bytes recebidos",
-                saved_path, bytes_recv, file_size,
+            log.warning("Recurso '%s' não encontrado. Retornando 404.", filename)
+            error_body = "<html><body><h1>404 Not Found</h1></body></html>"
+            header = (
+                f"HTTP/1.1 404 Not Found\r\n"
+                f"Content-Type: text/html\r\n"
+                f"Content-Length: {len(error_body)}\r\n"
+                f"X-Custom-Auth: {expected_auth}\r\n"
+                f"\r\n"
             )
+            conn.sendall(header.encode("utf-8") + error_body.encode("utf-8"))
 
     except Exception as err:
         log.error("Erro inesperado ao tratar %s:%d → %s", *addr, err)
 
     finally:
-        if file_handle and not file_handle.closed:
-            file_handle.close()
         conn.close()
         log.info("Conexão com %s:%d encerrada.", *addr)
 
@@ -195,10 +126,7 @@ def handle_client(conn: socket.socket, addr: tuple, expected_auth: str, output_d
 
 class TCPServer:
     """
-    Servidor TCP de transferência de arquivos
-
-    Aceita múltiplas conexões sequenciais (ou simultâneas via threads)
-    Cada cliente é atendido em uma thread daemon independente
+    Servidor TCP de transferência de arquivos (Mini-Servidor HTTP/1.1)
     """
 
     def __init__(
@@ -214,19 +142,16 @@ class TCPServer:
         self.output_dir    = output_dir
         self.expected_auth = build_auth_token(matricula, nome)
 
-        os.makedirs(output_dir, exist_ok=True)
-
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((host, port))
         self.sock.listen(5)
 
-        log.info("Servidor TCP escutando em %s:%d", host or "0.0.0.0", port)
+        log.info("Servidor HTTP/TCP escutando em %s:%d", host or "0.0.0.0", port)
         log.info("Token de auth esperado : %s", self.expected_auth)
 
     def serve_forever(self) -> None:
-        """Aceita conexões em loop. Cada cliente é despachado para uma thread"""
-        log.info("Aguardando clientes…  (Ctrl+C para parar)")
+        log.info("Aguardando requisições HTTP…  (Ctrl+C para parar)")
         try:
             while True:
                 try:
@@ -237,7 +162,7 @@ class TCPServer:
 
                 t = threading.Thread(
                     target=handle_client,
-                    args=(conn, addr, self.expected_auth, self.output_dir),
+                    args=(conn, addr, self.expected_auth),
                     daemon=True,
                     name=f"client-{addr[0]}:{addr[1]}",
                 )
@@ -252,10 +177,10 @@ class TCPServer:
 # Interface do terminal
 # -------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Servidor TCP Baseline — Redes II UFPI")
+    p = argparse.ArgumentParser(description="Servidor HTTP/TCP — Redes II UFPI")
     p.add_argument("--host", default=DEFAULT_HOST, help="Interface de bind")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help="Porta TCP")
-    p.add_argument("--output-dir", default=OUTPUT_DIR, help="Diretório de saída")
+    p.add_argument("--output-dir", default=OUTPUT_DIR, help="Diretório de saída (não usado em HTTP GET, mas mantido por compatibilidade)")
     p.add_argument("--matricula", default="20239000313", help="Matrícula do aluno")
     p.add_argument("--nome", default="Marcio Rodrigues", help="Nome do aluno")
     return p.parse_args()
